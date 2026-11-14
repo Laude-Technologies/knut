@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import threading
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -19,6 +20,7 @@ class OutOfScope(Exception):
 class Scope:
     def __init__(self, path: Path):
         self.path = Path(path)
+        self._lock = threading.Lock()  # a host like knuth-web calls add/check from several threads
         self.allow: list[str] = []
         self.deny: list[str] = []
         if self.path.exists():
@@ -32,20 +34,22 @@ class Scope:
 
     def add(self, pattern: str, deny: bool = False) -> None:
         pattern = pattern.lower().strip()
-        bucket = self.deny if deny else self.allow
-        if pattern not in bucket:
-            bucket.append(pattern)
-        self.save()
+        with self._lock:
+            bucket = self.deny if deny else self.allow
+            if pattern not in bucket:
+                bucket.append(pattern)
+            self.save()
 
     def remove(self, pattern: str) -> bool:
         pattern = pattern.lower().strip()
-        hit = False
-        for bucket in (self.allow, self.deny):
-            if pattern in bucket:
-                bucket.remove(pattern)
-                hit = True
-        self.save()
-        return hit
+        with self._lock:
+            hit = False
+            for bucket in (self.allow, self.deny):
+                if pattern in bucket:
+                    bucket.remove(pattern)
+                    hit = True
+            self.save()
+            return hit
 
     @staticmethod
     def _keys(url: str) -> list[str]:
@@ -60,9 +64,10 @@ class Scope:
         keys = self._keys(url)
         if not keys:
             return False
-        if any(fnmatch.fnmatchcase(k, p) for k in keys for p in self.deny):
-            return False
-        return any(fnmatch.fnmatchcase(k, p) for k in keys for p in self.allow)
+        with self._lock:
+            if any(fnmatch.fnmatchcase(k, p) for k in keys for p in self.deny):
+                return False
+            return any(fnmatch.fnmatchcase(k, p) for k in keys for p in self.allow)
 
     def require(self, url: str) -> None:
         if not self.check(url):
