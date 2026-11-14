@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import time
 from pathlib import Path
 
@@ -26,32 +27,44 @@ CREATE TABLE IF NOT EXISTS flows (
 
 
 class Store:
+    """Thread-safe: the CLI only ever touches this from one thread, but a host
+    like knuth-web calls it from FastAPI's worker threads and the asyncio event
+    loop thread interchangeably, and a bare sqlite3.Connection isn't safe to
+    share across threads even with check_same_thread=False - that flag only
+    lifts sqlite's own same-thread check, it doesn't serialize access. The lock
+    here does the serializing.
+    """
+
     def __init__(self, home: Path):
         home = Path(home)
         home.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(home / "history.db")
-        self.db.executescript(SCHEMA)
+        self._lock = threading.Lock()
+        self.db = sqlite3.connect(home / "history.db", check_same_thread=False)
+        with self._lock:
+            self.db.executescript(SCHEMA)
 
     def add(self, req: HttpRequest, resp: HttpResponse | None, source: str) -> int:
-        cur = self.db.execute(
-            "INSERT INTO flows (ts, source, method, url, req_headers, req_body, status,"
-            " resp_headers, resp_body, elapsed) VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (
-                time.time(), source, req.method, req.url, json.dumps(req.headers), req.body,
-                resp.status if resp else None,
-                json.dumps(resp.headers) if resp else None,
-                resp.body if resp else None,
-                resp.elapsed if resp else None,
-            ),
-        )
-        self.db.commit()
-        return int(cur.lastrowid)
+        with self._lock:
+            cur = self.db.execute(
+                "INSERT INTO flows (ts, source, method, url, req_headers, req_body, status,"
+                " resp_headers, resp_body, elapsed) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (
+                    time.time(), source, req.method, req.url, json.dumps(req.headers), req.body,
+                    resp.status if resp else None,
+                    json.dumps(resp.headers) if resp else None,
+                    resp.body if resp else None,
+                    resp.elapsed if resp else None,
+                ),
+            )
+            self.db.commit()
+            return int(cur.lastrowid)
 
     def get(self, flow_id: int) -> tuple[HttpRequest, HttpResponse | None]:
-        row = self.db.execute(
-            "SELECT method,url,req_headers,req_body,status,resp_headers,resp_body,elapsed"
-            " FROM flows WHERE id=?", (flow_id,)
-        ).fetchone()
+        with self._lock:
+            row = self.db.execute(
+                "SELECT method,url,req_headers,req_body,status,resp_headers,resp_body,elapsed"
+                " FROM flows WHERE id=?", (flow_id,)
+            ).fetchone()
         if not row:
             raise KeyError(f"no flow with id {flow_id}")
         method, url, rh, rb, status, sh, sb, el = row
@@ -74,4 +87,5 @@ class Store:
             q += " WHERE " + " AND ".join(where)
         q += " ORDER BY id DESC LIMIT ?"
         args.append(limit)
-        return list(reversed(self.db.execute(q, args).fetchall()))
+        with self._lock:
+            return list(reversed(self.db.execute(q, args).fetchall()))
