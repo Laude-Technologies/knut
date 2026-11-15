@@ -1,4 +1,4 @@
-# knuth
+# knut
 
 Scope-enforced web application testing toolkit: logging proxy, repeater, positional fuzzer, crawler and scanner, all sharing one SQLite flow history. Python 3.10+, single dependency (`httpx`).
 
